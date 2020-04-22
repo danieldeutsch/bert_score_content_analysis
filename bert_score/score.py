@@ -17,7 +17,7 @@ from .utils import (get_model, get_idf_dict, bert_cos_score_idf,
                     cache_scibert, sent_encode)
 
 
-__all__ = ['score', 'plot_example']
+__all__ = ['score', 'create_idf_dict', 'plot_example']
 
 
 def create_idf_dict(refs, model_type=None, nthreads=4, lang=None):
