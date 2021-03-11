@@ -78,12 +78,16 @@ def sent_encode(tokenizer, sent):
     "Encoding as sentence based on the tokenizer"
     if isinstance(tokenizer, GPT2Tokenizer):
         # for RoBERTa and GPT-2
-        return tokenizer.encode(sent.strip(), add_special_tokens=True,
+        x = tokenizer.encode(sent.strip(), add_special_tokens=True,
                                 add_prefix_space=True,
                                 max_length=tokenizer.max_len)
     else:
-        return tokenizer.encode(sent.strip(), add_special_tokens=True,
+        x = tokenizer.encode(sent.strip(), add_special_tokens=True,
                                 max_length=tokenizer.max_len)
+    # print(x)
+    # print(len(x))
+    # exit()
+    return x
 
 
 def get_model(model_type, num_layers, all_layers=None):
@@ -202,6 +206,7 @@ def collate_idf(arr, tokenizer, idf_dict, device='cuda:0'):
         - :param: `device` (str): device to use, e.g. 'cpu' or 'cuda'
     """
     arr = [sent_encode(tokenizer, a) for a in arr]
+    subwords_list = [tokenizer.convert_ids_to_tokens(a) for a in arr]
 
     idf_weights = [[idf_dict[i] for i in a] for a in arr]
 
@@ -213,11 +218,11 @@ def collate_idf(arr, tokenizer, idf_dict, device='cuda:0'):
     padded = padded.to(device=device)
     mask = mask.to(device=device)
     lens = lens.to(device=device)
-    return padded, padded_idf, lens, mask
+    return padded, padded_idf, lens, mask, subwords_list
 
 
 def get_bert_embedding(all_sens, model, tokenizer, idf_dict,
-                       batch_size=-1, device='cuda:0', 
+                       batch_size=-1, device='cuda:0',
                        all_layers=False):
     """
     Compute BERT embedding in batches.
@@ -231,10 +236,10 @@ def get_bert_embedding(all_sens, model, tokenizer, idf_dict,
         - :param: `device` (str): device to use, e.g. 'cpu' or 'cuda'
     """
 
-    padded_sens, padded_idf, lens, mask = collate_idf(all_sens,
-                                                      tokenizer,
-                                                      idf_dict,
-                                                      device=device)
+    padded_sens, padded_idf, lens, mask, subwords_list = collate_idf(all_sens,
+                                                                     tokenizer,
+                                                                     idf_dict,
+                                                                     device=device)
 
     if batch_size == -1: batch_size = len(all_sens)
 
@@ -249,11 +254,88 @@ def get_bert_embedding(all_sens, model, tokenizer, idf_dict,
 
     total_embedding = torch.cat(embeddings, dim=0)
 
-    return total_embedding, mask, padded_idf
+    return total_embedding, mask, padded_idf, subwords_list
 
 
-def greedy_cos_idf(ref_embedding, ref_masks, ref_idf,
-                   hyp_embedding, hyp_masks, hyp_idf,
+def map_subword_index_to_token_index(subwords):
+    assert subwords[0] == '<s>'
+    assert subwords[-1] == '</s>'
+
+    mapping = {}
+    current = -1
+    for i, subword in enumerate(subwords):
+        if subword in ['<s>', '</s>'] or subword[0] == 'Ġ':
+            current += 1
+        mapping[i] = current
+    return mapping
+
+
+def get_precision_token_alignments(ref_subwords_list, hyp_subwords_list,
+                                   indices, masks, scores, token_weights):
+    alignments = []
+    weights = []
+    batch_size, num_tokens = indices.size()
+    for i in range(batch_size):
+        alignment = Counter()
+        weights_dict = Counter()
+        ref_subword_index_to_token_index = map_subword_index_to_token_index(ref_subwords_list[i])
+        hyp_subword_index_to_token_index = map_subword_index_to_token_index(hyp_subwords_list[i])
+        for j in range(num_tokens):
+            k = indices[i, j].item()
+            score = scores[i, j].item()
+            token_weight = token_weights[i, j].item()
+
+            if masks[i, j, k] == 1.0:
+                hyp_index = hyp_subword_index_to_token_index[j]
+                ref_index = ref_subword_index_to_token_index[k]
+                alignment[(hyp_index, ref_index)] += score
+                weights_dict[hyp_index] += token_weight
+
+        alignments.append([])
+        for (hyp_index, ref_index), score in alignment.items():
+            alignments[-1].append((hyp_index, ref_index, score))
+
+        weights.append([])
+        for hyp_index in range(len(weights_dict)):
+            weights[-1].append(weights_dict[hyp_index])
+
+    return alignments, weights
+
+
+def get_recall_token_alignments(ref_subwords_list, hyp_subwords_list,
+                                indices, masks, scores, token_weights):
+    alignments = []
+    weights = []
+    batch_size, num_tokens = indices.size()
+    for i in range(batch_size):
+        alignment = Counter()
+        weights_dict = Counter()
+        ref_subword_index_to_token_index = map_subword_index_to_token_index(ref_subwords_list[i])
+        hyp_subword_index_to_token_index = map_subword_index_to_token_index(hyp_subwords_list[i])
+        for k in range(num_tokens):
+            j = indices[i, k].item()
+            score = scores[i, k].item()
+            token_weight = token_weights[i, k].item()
+
+            if masks[i, j, k] == 1.0:
+                ref_index = ref_subword_index_to_token_index[k]
+                hyp_index = hyp_subword_index_to_token_index[j]
+                alignment[(hyp_index, ref_index)] += score
+                weights_dict[ref_index] += token_weight
+
+        alignments.append([])
+        for (hyp_index, ref_index), score in alignment.items():
+            alignments[-1].append((hyp_index, ref_index, score))
+
+        weights.append([])
+        for hyp_index in range(len(weights_dict)):
+            weights[-1].append(weights_dict[hyp_index])
+
+    return alignments, weights
+
+
+def greedy_cos_idf(ref_embedding, ref_masks, ref_idf, ref_subwords_list,
+                   hyp_embedding, hyp_masks, hyp_idf, hyp_subwords_list,
                    all_layers=False):
     """
     Compute greedy matching based on cosine similarity.
@@ -298,11 +380,12 @@ def greedy_cos_idf(ref_embedding, ref_masks, ref_idf,
     masks = masks.float().to(sim.device)
     sim = sim * masks
 
-    word_precision = sim.max(dim=2)[0]
-    word_recall = sim.max(dim=1)[0]
+    word_precision, indices_precision = sim.max(dim=2)
+    word_recall, indices_recall = sim.max(dim=1)
 
-    hyp_idf.div_(hyp_idf.sum(dim=1, keepdim=True))
-    ref_idf.div_(ref_idf.sum(dim=1, keepdim=True))
+    precision_normalization_factor = hyp_idf.sum(dim=1, keepdim=True)
+    reference_normalization_factor = ref_idf.sum(dim=1, keepdim=True)
+
     precision_scale = hyp_idf.to(word_precision.device)
     recall_scale = ref_idf.to(word_recall.device)
     if all_layers:
@@ -310,9 +393,19 @@ def greedy_cos_idf(ref_embedding, ref_masks, ref_idf,
             .expand(L, B, -1).contiguous().view_as(word_precision)
         recall_scale = recall_scale.unsqueeze(0)\
             .expand(L, B, -1).contiguous().view_as(word_recall)
-    P = (word_precision * precision_scale).sum(dim=1)
-    R = (word_recall * recall_scale).sum(dim=1)
+
+    precision_unnorm_scores = word_precision * precision_scale
+    recall_unnorm_scores = word_recall * recall_scale
+
+    precision_scores = torch.div(precision_unnorm_scores, precision_normalization_factor)
+    recall_scores = torch.div(recall_unnorm_scores, reference_normalization_factor)
+
+    P = precision_scores.sum(dim=1)
+    R = recall_scores.sum(dim=1)
     F = 2 * P * R / (P + R)
+
+    precision_alignments, precision_weights = get_precision_token_alignments(ref_subwords_list, hyp_subwords_list, indices_precision, masks, precision_unnorm_scores, precision_scale)
+    recall_alignments, recall_weights = get_recall_token_alignments(ref_subwords_list, hyp_subwords_list, indices_recall, masks, recall_unnorm_scores, recall_scale)
 
     hyp_zero_mask = hyp_masks.sum(dim=1).eq(2)
     ref_zero_mask = ref_masks.sum(dim=1).eq(2)
@@ -332,7 +425,7 @@ def greedy_cos_idf(ref_embedding, ref_masks, ref_idf,
 
     F = F.masked_fill(torch.isnan(F), 0.)
 
-    return P, R, F
+    return P, R, F, precision_alignments, recall_alignments, precision_weights, recall_weights
 
 def bert_cos_score_idf(model, refs, hyps, tokenizer, idf_dict,
                        verbose=False, batch_size=64, device='cuda:0',
@@ -357,14 +450,14 @@ def bert_cos_score_idf(model, refs, hyps, tokenizer, idf_dict,
     sentences = dedup_and_sort(refs+hyps)
     embs = []
     iter_range = range(0, len(sentences), batch_size)
-    if verbose: 
+    if verbose:
         print("computing bert embedding.")
         iter_range = tqdm(iter_range)
     stats_dict = dict()
     for batch_start in iter_range:
         sen_batch = sentences[batch_start:batch_start+batch_size]
-        embs, masks, padded_idf = get_bert_embedding(sen_batch, model, tokenizer, idf_dict,
-                                                     device=device, all_layers=all_layers)
+        embs, masks, padded_idf, subwords_list = get_bert_embedding(sen_batch, model, tokenizer, idf_dict,
+                                                                    device=device, all_layers=all_layers)
         embs = embs.cpu()
         masks = masks.cpu()
         padded_idf = padded_idf.cpu()
@@ -372,11 +465,12 @@ def bert_cos_score_idf(model, refs, hyps, tokenizer, idf_dict,
             sequence_len = masks[i].sum().item()
             emb = embs[i, :sequence_len]
             idf = padded_idf[i, :sequence_len]
-            stats_dict[sen] = (emb, idf)
-        
+            subwords = subwords_list[i]
+            stats_dict[sen] = (emb, idf, subwords)
+
     def pad_batch_stats(sen_batch, stats_dict, device):
         stats = [stats_dict[s] for s in sen_batch]
-        emb, idf = zip(*stats)
+        emb, idf, subwords_list = zip(*stats)
         lens = [e.size(0) for e in emb]
         emb_pad = pad_sequence(emb, batch_first=True, padding_value=2.)
         idf_pad = pad_sequence(idf, batch_first=True)
@@ -387,24 +481,30 @@ def bert_cos_score_idf(model, refs, hyps, tokenizer, idf_dict,
                         .expand(len(lens), max_len)
             return base < lens.unsqueeze(1)
         pad_mask = length_to_mask(lens)
-        return emb_pad.to(device), pad_mask.to(device), idf_pad.to(device)
-        
+        return emb_pad.to(device), pad_mask.to(device), idf_pad.to(device), subwords_list
+
 
     device = next(model.parameters()).device
     iter_range = range(0, len(refs), batch_size)
-    if verbose: 
+    if verbose:
         print("computing greedy matching.")
         iter_range = tqdm(iter_range)
+    precision_alignments_list, recall_alignments_list = [], []
+    precision_weights_list, recall_weights_list = [], []
     for batch_start in iter_range:
         batch_refs = refs[batch_start:batch_start+batch_size]
         batch_hyps = hyps[batch_start:batch_start+batch_size]
         ref_stats = pad_batch_stats(batch_refs, stats_dict, device)
         hyp_stats = pad_batch_stats(batch_hyps, stats_dict, device)
 
-        P, R, F1 = greedy_cos_idf(*ref_stats, *hyp_stats, all_layers)
+        P, R, F1, precision_alignments, recall_alignments, precision_weights, recall_weights = greedy_cos_idf(*ref_stats, *hyp_stats, all_layers)
         preds.append(torch.stack((P, R, F1), dim=-1).cpu())
+        precision_alignments_list.extend(precision_alignments)
+        recall_alignments_list.extend(recall_alignments)
+        precision_weights_list.extend(precision_weights)
+        recall_weights_list.extend(recall_weights)
     preds = torch.cat(preds, dim=1 if all_layers else 0)
-    return preds
+    return preds, precision_alignments_list, recall_alignments_list, precision_weights_list, recall_weights_list
 
 
 def get_hash(model, num_layers, idf, rescale_with_baseline):
@@ -444,7 +544,7 @@ def cache_scibert(model_type, cache_folder='~/.cache/torch/transformers'):
         with open(json_file, 'w') as f:
             print('{}', file=f)
 
-    if 'uncased' in model_type: 
+    if 'uncased' in model_type:
         json_file = os.path.join(filename, 'tokenizer_config.json')
         if not os.path.exists(json_file):
             with open(json_file, 'w') as f:

@@ -51,7 +51,8 @@ def create_idf_dict(refs, model_type=None, nthreads=4, lang=None):
 
 def score(cands, refs, model_type=None, num_layers=None, verbose=False,
           idf=False, device=None, batch_size=64, nthreads=4, all_layers=False,
-          lang=None, return_hash=False, rescale_with_baseline=False):
+          lang=None, return_hash=False, rescale_with_baseline=False,
+          return_alignments=False):
     """
     BERTScore metric.
 
@@ -137,15 +138,36 @@ def score(cands, refs, model_type=None, num_layers=None, verbose=False,
     if verbose:
         print('calculating scores...')
     start = time.perf_counter()
-    all_preds = bert_cos_score_idf(model, refs, cands, tokenizer, idf_dict,
-                                   verbose=verbose, device=device,
-                                   batch_size=batch_size, all_layers=all_layers).cpu()
+    all_preds, precision_alignments_list, recall_alignments_list, precision_weights_list, recall_weights_list \
+        = bert_cos_score_idf(model, refs, cands, tokenizer, idf_dict,
+                             verbose=verbose, device=device,
+                             batch_size=batch_size, all_layers=all_layers)
+    all_preds = all_preds.cpu()
 
+    precision_indices = []
+    recall_indices = []
     if ref_group_boundaries is not None:
         max_preds = []
+        max_precision_alignments = []
+        max_recall_alignments = []
+        max_precision_weights = []
+        max_recall_weights = []
         for start, end in ref_group_boundaries:
-            max_preds.append(all_preds[start:end].max(dim=0)[0])
+            values, indices = all_preds[start:end].max(dim=0)
+            p_index = indices[0]
+            r_index = indices[1]
+            max_preds.append(values)
+            max_precision_alignments.append(precision_alignments_list[start + p_index])
+            max_recall_alignments.append(recall_alignments_list[start + r_index])
+            max_precision_weights.append(precision_weights_list[start + p_index])
+            max_recall_weights.append(recall_weights_list[start + r_index])
+            precision_indices.append(p_index)
+            recall_indices.append(r_index)
         all_preds = torch.stack(max_preds, dim=0)
+        precision_alignments_list = max_precision_alignments
+        recall_alignments_list = max_recall_alignments
+        precision_weights_list = max_precision_weights
+        recall_weights_list = max_recall_weights
 
     if rescale_with_baseline:
         baseline_path = os.path.join(
@@ -166,14 +188,17 @@ def score(cands, refs, model_type=None, num_layers=None, verbose=False,
         else:
             print(f'Warning: Baseline not Found for {model_type} on {lang} at {baseline_path}', file=sys.stderr)
 
-    out = all_preds[..., 0], all_preds[..., 1], all_preds[..., 2] # P, R, F
+    out = (all_preds[..., 0], all_preds[..., 1], all_preds[..., 2]) # P, R, F
 
     if verbose:
         time_diff = time.perf_counter() - start
         print(f'done in {time_diff:.2f} seconds, {len(refs) / time_diff:.2f} sentences/sec')
 
     if return_hash:
-        return tuple([out, get_hash(model_type, num_layers, idf, rescale_with_baseline)])
+        out = out + (get_hash(model_type, num_layers, idf, rescale_with_baseline),)
+
+    if return_alignments:
+        out = out + (precision_alignments_list, recall_alignments_list, precision_indices, recall_indices, precision_weights_list, recall_weights_list)
 
     return out
 
